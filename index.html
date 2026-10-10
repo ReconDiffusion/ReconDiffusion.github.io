@@ -1,0 +1,1076 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="author" content="Saeed Razavi, Xingjian Leng, Liang Zheng">
+  <title>RECON: Representation Conditioning for Generation</title>
+  <meta name="description" content="RECON keeps the projection head that representation alignment discards and reuses it at inference to condition the later layers of a diffusion transformer on a semantic token. No extra parameters; 63x faster than SiT and 25x faster than REPA.">
+  <link rel="icon" type="image/svg+xml" href="static/images/favicon.svg">
+
+  <!-- Distill template (Apache-2.0). As on the RAE page, automatic d-title insertion is disabled;
+       "and others" in the bibliography is printed as "et al." -->
+  <script src="static/js/template.v2.js"></script>
+  <!-- KaTeX 0.16.9, bundled so the page also works offline -->
+  <link rel="stylesheet" href="static/katex/katex.min.css">
+  <link rel="stylesheet" href="static/css/style.css">
+  <script defer src="static/js/main.js"></script>
+  <script defer src="static/katex/katex.min.js"></script>
+  <script defer src="static/katex/contrib/auto-render.min.js" onload="renderMath()"></script>
+</head>
+<body>
+
+  <!-- ================================================================== HERO -->
+  <!-- Same title card as the opening frame of recon.gif. -->
+  <header class="hero">
+    <h1 class="hero-title">
+      <span class="wordmark"><span class="re">RE</span><span class="con">CON</span></span>
+      <span class="hero-subtitle"><b>RE</b>presentation <b>CON</b>ditioning for Generation</span>
+    </h1>
+    <p class="hero-tagline">Keep the projection head that REPA throws away&nbsp;&mdash; and condition on it.</p>
+    <span class="hero-rule" aria-hidden="true"></span>
+    <p class="hero-authors">
+      <span class="author">Saeed Razavi<sup>1</sup></span>, <span class="author">Xingjian Leng<sup>1</sup></span>, <span class="author">Liang Zheng<sup>1</sup></span>
+      <span class="hero-affil"><sup>1</sup><a href="https://www.anu.edu.au/" target="_blank" rel="noopener">Australian National University</a></span>
+    </p>
+    <!-- TODO: point the arXiv button at the arXiv page once it is public. -->
+    <nav class="hero-links" aria-label="Paper links">
+      <a class="btn soon" href="#" title="Coming soon" aria-disabled="true" onclick="return false;"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>arXiv</a>
+      <a class="btn" href="https://github.com/saeidrazavi/RECON" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>Code</a>
+      <a class="btn" href="https://huggingface.co/SaeedRazavi/RECON" target="_blank" rel="noopener"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96 12 12.01l8.73-5.05"/><path d="M12 22.08V12"/></svg>Models</a>
+      <a class="btn" href="#bibtex"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10 11H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v6c0 2-1 3.5-3 4"/><path d="M19 11h-4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v6c0 2-1 3.5-3 4"/></svg>BibTeX</a>
+    </nav>
+  </header>
+
+  <d-article>
+
+    <!-- ============================================================= CONTENTS -->
+    <nav class="toc" aria-label="Contents">
+      <h4>CONTENTS</h4>
+      <ol>
+        <li><a href="#overview">Overview</a></li>
+        <li><a href="#motivation">Why keep the projection head?</a></li>
+        <li><a href="#method">Representation conditioning</a></li>
+        <li><a href="#results">Faster convergence, better samples</a></li>
+        <li><a href="#dynamics">Richer semantics inside the model</a></li>
+        <li><a href="#generalization">Generalization and scalability</a></li>
+        <li><a href="#ablations">Design choices</a></li>
+        <li><a href="#discussion">Discussion</a></li>
+        <li><a href="#conclusion">Conclusion</a></li>
+      </ol>
+    </nav>
+
+    <!-- ============================================================ OVERVIEW -->
+    <section id="overview">
+      <h2>Overview</h2>
+      <p>
+        Aligning a diffusion transformer with a pretrained vision encoder is one of the most effective ways to make it train faster.
+        REPA<d-cite key="yu2025repa"></d-cite> attaches a small MLP projection head $g_\phi$ to an intermediate layer and trains it so that the projected features match those of a frozen encoder such as DINOv2<d-cite key="oquab2024dinov2"></d-cite>.
+        The alignment loss pushes semantics into the early layers of the backbone, and once training ends the head is discarded.
+        Follow-ups such as REG<d-cite key="wu2025reg"></d-cite>, DDT<d-cite key="wang2025ddt"></d-cite> and REPA-E<d-cite key="leng2025repae"></d-cite> keep this design.
+      </p>
+      <p>
+        We looked at where the semantics actually end up. The output of $g_\phi$ is better aligned with the vision encoder than <em>any</em> layer of the diffusion transformer, yet it is exactly the part that gets thrown away.
+        The later layers, which are supervised by the velocity loss alone, only ever see the less aligned backbone features.
+      </p>
+      <p>
+        <strong>RE</strong>presentation <strong>CON</strong>ditioning (<strong>RECON</strong>) is a simple fix: keep the head and use it.
+        During training, we pool the vision encoder tokens into a semantic token and feed it to the later layers alongside the patch tokens.
+        At inference, when there is no clean image to encode, the retained head $g_\phi$ stands in for the vision encoder.
+        RECON adds no parameters and converges <strong>63&times; faster than SiT</strong> and <strong>25&times; faster than REPA</strong>.
+      </p>
+
+      <figure class="l-page" id="fig-teaser">
+        <div class="teaser-grid">
+          <img class="t-img t-a zoomable" src="static/images/teaser/repa.png" alt="REPA: an MLP head on an intermediate SiT block is trained against a frozen visual encoder with the REPA loss and discarded at inference.">
+          <div class="t-div t-div1"></div>
+          <img class="t-img t-b zoomable" src="static/images/teaser/recon_train.png" alt="RECON training: the visual encoder output is pooled into a semantic token that is fed to the later SiT blocks, while the MLP head is still trained with the REPA loss.">
+          <div class="t-div t-div2"></div>
+          <img class="t-img t-c zoomable" src="static/images/teaser/recon_infer.png" alt="RECON inference: the MLP head output is pooled into the semantic token and fed to the later SiT blocks.">
+          <img class="t-img t-d zoomable" src="static/images/plots/fid_curve_teaser.svg" alt="gFID-50K against training steps: RECON reaches SiT-XL/2's final 8.30 about 63 times earlier and REPA's final 5.90 about 25 times earlier.">
+          <div class="subcap t-capa">(a) REPA</div>
+          <div class="subcap t-capb">(b) RECON training</div>
+          <div class="subcap t-capc">(c) RECON inference</div>
+          <div class="subcap t-capd">(d) Training steps vs. gFID-50K</div>
+        </div>
+        <div class="legend-row"><span><i class="swatch token"></i>Semantic token</span></div>
+        <figcaption>
+          <b>RECON conditions the later layers on the representation that REPA discards.</b>
+          (a) REPA trains a projection head $g_\phi$ against a frozen vision encoder through the REPA loss, then discards it at inference.
+          RECON inherits most of REPA, but (b) during training it also feeds the vision encoder's pooled features to the later layers as a semantic token, and (c) at inference it keeps $g_\phi$ as a proxy for the vision encoder and conditions the later layers in the same way.
+          (d) gFID-50K against training step on ImageNet 256&times;256 without guidance: RECON reaches the final quality of SiT-XL/2 and of REPA much earlier.
+        </figcaption>
+      </figure>
+    </section>
+
+    <!-- ========================================================== MOTIVATION -->
+    <section id="motivation">
+      <h2>Why Keep the Projection Head?</h2>
+      <p>
+        We measure how closely a set of features matches the vision encoder with CKNNA<d-cite key="huh2024platonic"></d-cite>, which compares the nearest-neighbour structure of two representations: images that are close in one should be close in the other.
+        A higher score means stronger alignment. All scores below are computed against clean-image DINOv2-B features on 10K ImageNet validation images, following REPA.
+      </p>
+
+      <figure class="l-body-outset">
+        <div class="pair-grid motivation-grid">
+          <img class="zoomable" src="static/images/plots/gfid_vs_cknna.svg" alt="Scatter plot of gFID against CKNNA over REPA training checkpoints from 50K to 400K iterations, with Pearson correlation r = -0.93.">
+          <img class="zoomable" src="static/images/plots/cknna_vs_block_t025.svg" alt="CKNNA of each SiT-XL/2 + REPA layer at t = 0.25; the projector output g_phi(h), shown as a dashed line near 0.55, is above every layer, which peak near 0.47 around layer 7.">
+          <div class="subcap">(a) gFID and CKNNA are strongly correlated</div>
+          <div class="subcap">(b) $g_\phi$ output is more aligned than any layer</div>
+        </div>
+        <figcaption>
+          <b>Alignment with the vision encoder, measured by CKNNA against DINOv2-B.</b>
+          (a) gFID against CKNNA over the training checkpoints of SiT-XL/2 + REPA.
+          (b) CKNNA of the backbone features at each layer ($t=0.25$). The dashed line is the CKNNA of the projector output $g_\phi(h)$, which is higher than that of any layer.
+        </figcaption>
+      </figure>
+
+      <p>Three observations motivate RECON:</p>
+      <ol class="observations">
+        <li><strong>Alignment tracks generation.</strong> Across REPA checkpoints, gFID falls as CKNNA rises (Pearson $r=-0.93$). Alignment and generation quality improve together.</li>
+        <li><strong>The projection head is the best-aligned module.</strong> The output of $g_\phi$ is closer to the vision encoder than every layer of the backbone. That is not surprising: the head sits right next to the encoder and is trained directly on the alignment loss.</li>
+        <li><strong>Yet it is discarded.</strong> After training, REPA-style methods drop $g_\phi$, so the later layers only see the backbone features $h$, which are less aligned with the vision encoder than $g_\phi(h)$.</li>
+      </ol>
+
+      <div class="finding-box">
+        <p><strong>Takeaway.</strong> Discarding $g_\phi$ throws away the most semantic module of an aligned diffusion transformer. RECON keeps it and gives the later layers direct access to the best-aligned features, at no extra cost.</p>
+      </div>
+    </section>
+
+    <!-- ============================================================== METHOD -->
+    <section id="method">
+      <h2>Representation Conditioning</h2>
+      <p>
+        <strong>Background.</strong> Following SiT<d-cite key="ma2024sit"></d-cite>, we train a diffusion transformer $v_\theta$ with flow matching<d-cite key="lipman2023flow,liu2023rectifiedflow"></d-cite> on VAE latents<d-cite key="rombach2022ldm"></d-cite>. With $z_0$ the latent of a clean image and $z_1\sim\mathcal{N}(0,I)$,
+      </p>
+      <div class="eq">$$z_t=(1-t)\,z_0+t\,z_1,\qquad \mathcal{L}_{\text{FM}}=\mathbb{E}_{t,x_0,z_1}\big[\lVert v_\theta(z_t,t)-(z_1-z_0)\rVert^2\big].$$</div>
+      <p>
+        As in REPA, we view the transformer as an encoder $\mathcal{E}_\theta$, made of the first $\ell$ blocks and producing $h=h^{(\ell)}$, followed by a decoder $\mathcal{D}_\theta$ made of the remaining blocks, which we call the <em>later layers</em>.
+        REPA adds an alignment loss, weighted by $\lambda$, between the projected features and the frozen encoder features $y_0=f_{\text{ext}}(x_0)$:
+      </p>
+      <div class="eq">$$\mathcal{L}_{\text{align}}=-\,\mathbb{E}_{t,x_0,z_1}\Big[\frac{1}{N}\sum_{n=1}^{N}\mathrm{sim}\big(y_0^{[n]},\,g_\phi(h^{[n]})\big)\Big],$$</div>
+      <p>where $n$ indexes patches and $\mathrm{sim}$ is cosine similarity. The alignment depth is $\ell=8$ for SiT-XL/2.</p>
+
+      <figure class="l-body-outset pipeline-tabs" id="pipeline">
+        <div class="seg" role="tablist" aria-label="Show RECON at">
+          <button type="button" role="tab" id="tab-training" aria-controls="panel-training" aria-selected="true">Training</button>
+          <button type="button" role="tab" id="tab-inference" aria-controls="panel-inference" aria-selected="false" tabindex="-1">Inference</button>
+        </div>
+        <div class="pt-panel" role="tabpanel" id="panel-training" aria-labelledby="tab-training">
+          <picture>
+            <source media="(prefers-reduced-motion: reduce)" srcset="static/images/method/recon_training_still.png">
+            <img class="zoomable" src="static/images/method/recon_training.gif" width="960" height="540" loading="lazy" alt="RECON training: the frozen vision encoder's features of the clean image are pooled into one semantic token, which is appended to the input of the later SiT blocks; the MLP head is still trained with the REPA loss.">
+          </picture>
+        </div>
+        <div class="pt-panel" role="tabpanel" id="panel-inference" aria-labelledby="tab-inference" hidden>
+          <picture>
+            <source media="(prefers-reduced-motion: reduce)" srcset="static/images/method/recon_inference_still.png">
+            <img class="zoomable" src="static/images/method/recon_inference.gif" width="960" height="540" loading="lazy" alt="RECON inference: with no clean image, the MLP head's output is pooled into the semantic token, which is appended to the input of the later SiT blocks.">
+          </picture>
+        </div>
+        <figcaption><b>RECON at training and inference time.</b> During training, the semantic token is pooled from the vision encoder's features of the clean image; at inference, from the output of the retained head $g_\phi$. Either way it is appended to the input of the later blocks. Click the animation to enlarge it.</figcaption>
+      </figure>
+
+      <h3>Semantic tokens</h3>
+      <p>
+        Let $y_0=f_{\text{ext}}(x_0)\in\mathbb{R}^{N\times D}$ be the vision encoder features of the clean image.
+        We pool them into $k\ll N$ semantic tokens and match them to the hidden width $C$ of the transformer:
+      </p>
+      <div class="eq">$$s=m\big(\mathrm{Pool}(y_0)\big)\in\mathbb{R}^{k\times C}.$$</div>
+      <p>
+        $\mathrm{Pool}$ is parameter-free average pooling, and we use a single token ($k=1$) by default.
+        The dimension-matching map $m$ is the identity when $D=C$, zero-padding when $D&lt;C$, and a linear layer otherwise.
+        With DINOv2-B ($D=768$) and SiT-B, L or XL, $m$ is the identity or zero-padding, so <strong>RECON adds no parameters</strong>; only Small models, whose width is below the encoder's, need a linear map, with fewer than 1M parameters.
+      </p>
+
+      <h3>In-context conditioning</h3>
+      <p>The semantic tokens are concatenated with the patch tokens and processed by every later block:</p>
+      <div class="eq">$$\tilde h=\big[\,h\,;\,s\,\big]\in\mathbb{R}^{(N+k)\times C},\qquad \hat v=\mathcal{D}_\theta(\tilde h,t).$$</div>
+      <p>The patch tokens can attend to the semantic token at any depth, and the semantic tokens are dropped before the final block.</p>
+
+      <h3>Teacher forcing, with time-dependent injection</h3>
+      <div class="split wide-left">
+        <div>
+          <p>
+            During training, we build the semantic token from the ground-truth encoder features $y_0$, much like teacher forcing in language models.
+            We could build it from $g_\phi(h)$ instead, but $g_\phi$ is itself being trained: its output starts far from $y_0$ and keeps moving, so the later layers would be asked to rely on a signal that is neither accurate nor stable.
+            $y_0$, by contrast, is stable from the first step.
+          </p>
+        </div>
+        <div class="mini-table">
+          <p class="tcap"><b>Teacher forcing vs. other strategies.</b> Source of the training-time token; gFID and IS after 100K iterations.</p>
+          <div class="table-wrap">
+            <table class="rtable">
+              <thead><tr><th class="l">Tokens built from</th><th>gFID&darr;</th><th>IS&uarr;</th></tr></thead>
+              <tbody>
+                <tr class="ours"><td class="l">$f_{\text{ext}}(x_0)$</td><td>9.2</td><td>118.8</td></tr>
+                <tr><td class="l">$g_\phi(h)$, online</td><td>17.1</td><td>76.3</td></tr>
+                <tr><td class="l">$g_\phi(h)$, EMA</td><td>16.8</td><td>77.5</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <p>
+        Teacher forcing at every timestep would open a train&ndash;inference gap.
+        At inference the token comes from $g_\phi(h)$, which approximates $y_0$ well at low noise levels and poorly at high ones, so training on $y_0$ at high noise would teach $\mathcal{D}_\theta$ to rely on information it will not get at generation time.
+        We therefore inject the token only below a noise threshold during training, and let $\mathcal{D}_\theta$ run on $h$ alone otherwise:
+      </p>
+      <div class="eq">$$s=\begin{cases} m\big(\mathrm{Pool}(y_0)\big), & t&lt;t_{\max}\\[2pt] \varnothing, & t\ge t_{\max}\end{cases}\qquad(t_{\max}=0.5).$$</div>
+      <h3>Inference: the projection head as a proxy encoder</h3>
+      <div class="split wide-left">
+        <div>
+          <p>There is no clean image at inference, so we reuse the projection head:</p>
+          <div class="eq">$$s=m\big(\mathrm{Pool}(g_\phi(h))\big).$$</div>
+          <p>
+            $g_\phi$ was trained to predict the vision encoder features from $h$, which makes it a natural stand-in.
+            Unlike training, we inject the token at <em>every</em> sampling step, which works clearly better: the decoder appears to apply what it learned at low noise levels across the whole trajectory (more in the <a href="#trajectory">discussion</a>).
+          </p>
+        </div>
+        <div class="mini-table" id="tab-injection">
+          <p class="tcap"><b>Injection at inference.</b> Semantic token only for $t&lt;t_{\max}$, as in training, or at every sampling step.</p>
+          <div class="table-wrap">
+            <table class="rtable">
+              <thead><tr><th class="l">Injected at</th><th>gFID&darr;</th><th>IS&uarr;</th></tr></thead>
+              <tbody>
+                <tr><td class="l">$t&lt;t_{\max}$ only</td><td>6.3</td><td>149.9</td></tr>
+                <tr class="ours"><td class="l">All timesteps</td><td>3.2</td><td>202.2</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <p>Put together, RECON changes only a few lines of a REPA training and sampling step:</p>
+<pre class="code"><span class="c"># one training step (REPA + RECON); lines marked ◀ are what RECON adds</span>
+z0, z1, t = vae.encode(x0), randn_like(z0), rand()
+zt = (1 - t) * z0 + t * z1
+y0 = vision_encoder(x0)                     <span class="c"># frozen DINOv2-B, N x D</span>
+h  = early_blocks(zt, t, c)                 <span class="c"># first ℓ = 8 blocks</span>
+loss_align = -cos_sim(g_phi(h), y0).mean()  <span class="c"># REPA loss</span>
+<span class="add">if t &lt; t_max:                               </span><span class="mark">◀</span> <span class="c">teacher forcing, low noise only</span>
+<span class="add">    s = zero_pad(avg_pool(y0, k=1), C)      </span><span class="mark">◀</span> <span class="c">one semantic token</span>
+<span class="add">    h = concat([h, s])                      </span><span class="mark">◀</span> <span class="c">in-context conditioning</span>
+v = later_blocks(h, t, c)                   <span class="c"># token dropped before the last block</span>
+loss = mse(v, z1 - z0) + λ * loss_align
+
+<span class="c"># one sampling step: g_phi is kept and stands in for the vision encoder</span>
+h = early_blocks(zt, t, c)
+<span class="add">s = zero_pad(avg_pool(g_phi(h), k=1), C)    </span><span class="mark">◀</span> <span class="c">at every step</span>
+<span class="add">v = later_blocks(concat([h, s]), t, c)      </span><span class="mark">◀</span></pre>
+      <p class="tcap" style="margin-top:6px">Pseudo-code for illustration: $c$ is the class label, and the $t&lt;t_{\max}$ test is applied per sample.</p>
+    </section>
+
+    <!-- ============================================================= RESULTS -->
+    <section id="results">
+      <h2>Faster Convergence, Better Samples</h2>
+      <div class="setup-box">
+        <strong>Setup.</strong> Class-conditional ImageNet<d-cite key="deng2009imagenet"></d-cite> 256&times;256 with SD-VAE latents, SiT-B/2, L/2 and XL/2, batch size 256.
+        RECON uses DINOv2-B as the target, alignment depth 8 (4 for SiT-B/2), $k=1$, $t_{\max}=0.5$ and zero-padding.
+        We report gFID, IS, precision and recall on 50K samples drawn with an SDE sampler at 250 steps.
+        One epoch is about 5K iterations, so 400K iterations are 80 epochs.
+      </div>
+
+      <h3>Class-conditional generation on ImageNet 256&times;256</h3>
+      <p>
+        Without guidance, RECON reaches <strong>gFID 3.25 at 400K iterations</strong>, ahead of REG (3.40) and REPA-E (4.07) at the same budget and far ahead of REPA (7.90).
+        Training longer brings it to 2.54 at 1M and <strong>2.21 at 2.4M iterations</strong>.
+        With autoguidance<d-cite key="karras2024autoguidance"></d-cite>, RECON reaches FID 2.26 after only 80 epochs, already better than MaskDiT (2.28, 1600 epochs) and DiT (2.27, 1400 epochs); at 480 epochs it reaches 1.73, better than SiT (2.06, 1400 epochs) and REPA (1.80, 800 epochs).
+      </p>
+
+      <figure id="c2i-tables">
+        <div class="seg" role="tablist" aria-label="Show the results">
+          <button type="button" role="tab" id="tab-c2i-unguided" aria-controls="panel-c2i-unguided" aria-selected="true">Without guidance</button>
+          <button type="button" role="tab" id="tab-c2i-guided" aria-controls="panel-c2i-guided" aria-selected="false" tabindex="-1">With guidance</button>
+        </div>
+        <div role="tabpanel" id="panel-c2i-unguided" aria-labelledby="tab-c2i-unguided">
+          <p class="tcap"><b>gFID without guidance</b> on ImageNet 256&times;256. SD-VAE latents unless noted; &dagger;: VA-VAE latents.</p>
+          <div class="table-wrap">
+            <table class="rtable">
+              <thead><tr><th class="l">Method</th><th>Iter.</th><th>gFID&darr;</th></tr></thead>
+              <tbody>
+                <tr class="group"><td colspan="3">No representation alignment</td></tr>
+                <tr><td class="l">DiT-XL/2<d-cite key="peebles2023dit"></d-cite></td><td>7M</td><td>9.60</td></tr>
+                <tr><td class="l">SiT-XL/2<d-cite key="ma2024sit"></d-cite></td><td>7M</td><td>8.30</td></tr>
+                <tr><td class="l">MDT<d-cite key="gao2023mdt"></d-cite></td><td>6.5M</td><td>6.23</td></tr>
+                <tr><td class="l">MaskDiT<d-cite key="zheng2024maskdit"></d-cite></td><td>8M</td><td>5.69</td></tr>
+                <tr class="group"><td colspan="3">Alignment without an external encoder</td></tr>
+                <tr><td class="l">SRA<d-cite key="jiang2026sra"></d-cite></td><td>4M</td><td>7.27</td></tr>
+                <tr><td class="l">LayerSync<d-cite key="haghighi2026layersync"></d-cite></td><td>4M</td><td>6.32</td></tr>
+                <tr><td class="l">Self-Flow<d-cite key="chefer2026selfflow"></d-cite></td><td>4M</td><td>5.70</td></tr>
+                <tr class="group"><td colspan="3">Alignment with an external encoder</td></tr>
+                <tr><td class="l">REPA<d-cite key="yu2025repa"></d-cite></td><td>400K</td><td>7.90</td></tr>
+                <tr><td class="l">REPA</td><td>4M</td><td>5.90</td></tr>
+                <tr><td class="l">REG<d-cite key="wu2025reg"></d-cite></td><td>400K</td><td>3.40</td></tr>
+                <tr><td class="l">REG</td><td>1M</td><td>2.70</td></tr>
+                <tr><td class="l">LightningDiT&dagger;<d-cite key="yao2025vavae"></d-cite></td><td>400K</td><td>4.29</td></tr>
+                <tr><td class="l">REPA-E<d-cite key="leng2025repae"></d-cite></td><td>400K</td><td>4.07</td></tr>
+                <tr class="ours sep"><td class="l">RECON</td><td>100K</td><td>9.25</td></tr>
+                <tr class="ours"><td class="l">RECON</td><td>200K</td><td>4.64</td></tr>
+                <tr class="ours"><td class="l">RECON</td><td>400K</td><td>3.25</td></tr>
+                <tr class="ours"><td class="l">RECON</td><td>1M</td><td>2.54</td></tr>
+                <tr class="ours"><td class="l">RECON</td><td>2.4M</td><td>2.21</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+        <div role="tabpanel" id="panel-c2i-guided" aria-labelledby="tab-c2i-guided" hidden>
+          <p class="tcap"><b>System-level comparison</b> on ImageNet 256&times;256 with guidance. RECON: Autoguidance<d-cite key="karras2024autoguidance"></d-cite>. Baselines: CFG (*: scheduled), from their papers.</p>
+          <div class="table-wrap">
+            <table class="rtable">
+              <thead><tr><th class="l">Model</th><th>Epochs</th><th>FID&darr;</th><th>IS&uarr;</th><th>Pre.&uarr;</th><th>Rec.&uarr;</th></tr></thead>
+              <tbody>
+                <tr class="group"><td colspan="6">Pixel diffusion</td></tr>
+                <tr><td class="l">ADM-G + ADM-U<d-cite key="dhariwal2021adm"></d-cite></td><td>400</td><td>3.94</td><td>186.7</td><td>0.82</td><td>0.52</td></tr>
+                <tr><td class="l">VDM++<d-cite key="kingma2023vdmpp"></d-cite></td><td>560</td><td>2.40</td><td>225.3</td><td>&ndash;</td><td>&ndash;</td></tr>
+                <tr><td class="l">Simple diffusion<d-cite key="hoogeboom2023simple"></d-cite></td><td>800</td><td>2.77</td><td>211.8</td><td>&ndash;</td><td>&ndash;</td></tr>
+                <tr><td class="l">CDM<d-cite key="ho2022cdm"></d-cite></td><td>2160</td><td>4.88</td><td>158.7</td><td>&ndash;</td><td>&ndash;</td></tr>
+                <tr class="group"><td colspan="6">Latent diffusion, U-Net</td></tr>
+                <tr><td class="l">LDM-4<d-cite key="rombach2022ldm"></d-cite></td><td>200</td><td>3.60</td><td>247.7</td><td>0.87</td><td>0.48</td></tr>
+                <tr class="group"><td colspan="6">Latent diffusion, Transformer + U-Net hybrid</td></tr>
+                <tr><td class="l">U-ViT-H/2<d-cite key="bao2023uvit"></d-cite></td><td>240</td><td>2.29</td><td>263.9</td><td>0.82</td><td>0.57</td></tr>
+                <tr><td class="l">DiffiT*<d-cite key="hatamizadeh2024diffit"></d-cite></td><td>&ndash;</td><td>1.73</td><td>276.5</td><td>0.80</td><td>0.62</td></tr>
+                <tr><td class="l">MDTv2-XL/2*<d-cite key="gao2023mdt"></d-cite></td><td>1080</td><td>1.58</td><td>314.7</td><td>0.79</td><td>0.65</td></tr>
+                <tr class="group"><td colspan="6">Latent diffusion, Transformer</td></tr>
+                <tr><td class="l">MaskDiT</td><td>1600</td><td>2.28</td><td>276.6</td><td>0.80</td><td>0.61</td></tr>
+                <tr><td class="l">SD-DiT<d-cite key="zhu2024sddit"></d-cite></td><td>480</td><td>3.23</td><td>&ndash;</td><td>&ndash;</td><td>&ndash;</td></tr>
+                <tr><td class="l">DiT-XL/2</td><td>1400</td><td>2.27</td><td>278.2</td><td>0.83</td><td>0.57</td></tr>
+                <tr><td class="l">SiT-XL/2</td><td>1400</td><td>2.06</td><td>270.3</td><td>0.82</td><td>0.59</td></tr>
+                <tr><td class="l indent">+ REPA</td><td>800</td><td>1.80</td><td>284.0</td><td>0.81</td><td>0.61</td></tr>
+                <tr><td class="l indent">+ REPA*</td><td>800</td><td>1.42</td><td>305.7</td><td>0.80</td><td>0.65</td></tr>
+                <tr><td class="l indent">+ REG</td><td>480</td><td>1.40</td><td>296.9</td><td>0.77</td><td>0.66</td></tr>
+                <tr class="ours sep"><td class="l indent">+ RECON</td><td>80</td><td>2.26</td><td>241.22</td><td>0.82</td><td>0.57</td></tr>
+                <tr class="ours"><td class="l indent">+ RECON</td><td>480</td><td>1.73</td><td>273.67</td><td>0.81</td><td>0.61</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </figure>
+
+      <figure class="l-body-outset viewer" id="scaling-viewer">
+        <div class="thumbs" role="group" aria-label="Choose a class"></div>
+        <p class="thumbs-label">Pick a class. Both models use the same seed, noise and class label at every checkpoint.</p>
+        <div class="scaling-grid">
+          <div></div><div class="col-head arrow">Training iteration</div>
+          <div></div><div class="col-head">50K</div><div class="col-head">100K</div><div class="col-head">400K</div>
+          <div class="row-head repa">REPA</div>
+          <img class="zoomable" data-method="repa" data-iter="50k" alt="">
+          <img class="zoomable" data-method="repa" data-iter="100k" alt="">
+          <img class="zoomable" data-method="repa" data-iter="400k" alt="">
+          <div class="row-head recon">RECON</div>
+          <img class="zoomable" data-method="recon" data-iter="50k" alt="">
+          <img class="zoomable" data-method="recon" data-iter="100k" alt="">
+          <img class="zoomable" data-method="recon" data-iter="400k" alt="">
+        </div>
+        <figcaption>
+          <b>Representation conditioning improves visual scaling.</b> Samples from REPA and RECON at 50K, 100K and 400K training iterations, without classifier-free guidance.
+          RECON produces higher-quality images than REPA at each of these checkpoints.
+        </figcaption>
+      </figure>
+
+      <figure class="l-page">
+        <div class="c2i-grid">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_00.jpg" alt="Generated sample: a blue bird on a branch">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_01.jpg" alt="Generated sample: a sea turtle swimming">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_02.jpg" alt="Generated sample: an iguana on a log">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_03.jpg" alt="Generated sample: a peacock">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_04.jpg" alt="Generated sample: a mallard duck on water">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_05.jpg" alt="Generated sample: a husky">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_06.jpg" alt="Generated sample: a red fox">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_07.jpg" alt="Generated sample: a tabby cat">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_08.jpg" alt="Generated sample: a fly on a leaf">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_09.jpg" alt="Generated sample: a monarch butterfly">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_10.jpg" alt="Generated sample: a starfish on rocks">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_11.jpg" alt="Generated sample: a gorilla">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_12.jpg" alt="Generated sample: a baseball in grass">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_13.jpg" alt="Generated sample: a snorkeler underwater">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_14.jpg" alt="Generated sample: a violin and bow">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_15.jpg" alt="Generated sample: a stir-fried dish">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_16.jpg" alt="Generated sample: a cup of latte">
+          <img class="zoomable" src="static/images/samples/c2i/c2i_17.jpg" alt="Generated sample: a soap bubble">
+        </div>
+        <figcaption class="center"><b>Samples on ImageNet 256&times;256</b> from SiT-XL/2 + RECON, using classifier-free guidance with $w=4$.</figcaption>
+      </figure>
+
+      <h3>Text-to-image generation</h3>
+      <p>
+        Nothing in RECON is specific to class labels.
+        We train MMDiT<d-cite key="esser2024sd3"></d-cite> on MS-COCO<d-cite key="lin2014coco"></d-cite>, and NanoGen<d-cite key="leng2026diffusionbench"></d-cite>, a text-to-image setup with a DDT backbone, on BLIP3-o<d-cite key="chen2025blip3o"></d-cite>, about 36M image&ndash;text pairs.
+        RECON improves on REPA in both: without guidance, FID drops from 9.85 to <strong>8.26</strong> on MS-COCO and from 5.41 to <strong>3.90</strong> on BLIP3-o, with higher CLIP score and IS.
+        The BLIP3-o results are the more telling ones, since that training set is far larger than MS-COCO.
+      </p>
+
+      <figure class="l-body-outset">
+        <div class="tables-2 even">
+          <div>
+            <p class="tcap"><b>MS-COCO.</b> MMDiT, ODE sampler, 50 NFE, 150K iterations; $w$ is the guidance scale.</p>
+            <div class="table-wrap">
+              <table class="rtable">
+                <thead>
+                  <tr class="span-head"><th></th><th colspan="2">$w=1$</th><th colspan="2">$w=2$</th></tr>
+                  <tr><th class="l">Method</th><th>FID&darr;</th><th>CLIP&uarr;</th><th>FID&darr;</th><th>CLIP&uarr;</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td class="l">+ REPA</td><td>9.85</td><td>0.2273</td><td>4.73</td><td>0.2443</td></tr>
+                  <tr class="ours"><td class="l">+ RECON</td><td>8.26</td><td>0.2313</td><td>4.55</td><td>0.2462</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <p class="tcap"><b>BLIP3-o.</b> NanoGen, ODE sampler, 50 NFE, 100K iterations.</p>
+            <div class="table-wrap">
+              <table class="rtable">
+                <thead>
+                  <tr class="span-head"><th></th><th colspan="2">$w=1$</th><th colspan="2">$w=8$</th></tr>
+                  <tr><th class="l">Method</th><th>FID&darr;</th><th>IS&uarr;</th><th>FID&darr;</th><th>IS&uarr;</th></tr>
+                </thead>
+                <tbody>
+                  <tr><td class="l">+ REPA</td><td>5.41</td><td>22.40</td><td>5.30</td><td>27.61</td></tr>
+                  <tr class="ours"><td class="l">+ RECON</td><td>3.90</td><td>24.31</td><td>5.04</td><td>27.91</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </figure>
+
+      <figure class="l-page">
+        <div class="t2i-scroll">
+          <div class="t2i-block">
+            <span></span>
+            <p class="prompt">“A phoenix of fire in anime”</p>
+            <p class="prompt">“A Birman cat with blue eyes”</p>
+            <p class="prompt">“Galaxy”</p>
+            <p class="prompt">“The path to Heaven”</p>
+            <p class="prompt">“A living area with a television and a table”</p>
+            <span class="row-head repa">REPA</span>
+            <img class="zoomable" src="static/images/samples/t2i/t2i_00_repa.jpg" alt="REPA: a phoenix of fire in anime">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_01_repa.jpg" alt="REPA: a Birman cat with blue eyes">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_02_repa.jpg" alt="REPA: galaxy">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_03_repa.jpg" alt="REPA: the path to Heaven">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_04_repa.jpg" alt="REPA: a living area with a television and a table">
+            <span class="row-head recon">RECON</span>
+            <img class="zoomable" src="static/images/samples/t2i/t2i_00_recon.jpg" alt="RECON: a phoenix of fire in anime">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_01_recon.jpg" alt="RECON: a Birman cat with blue eyes">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_02_recon.jpg" alt="RECON: galaxy">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_03_recon.jpg" alt="RECON: the path to Heaven">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_04_recon.jpg" alt="RECON: a living area with a television and a table">
+          </div>
+          <div class="t2i-block">
+            <span></span>
+            <p class="prompt">“A green train is coming down the tracks”</p>
+            <p class="prompt">“A zebra standing at the edge of a pond”</p>
+            <p class="prompt">“A close up of a plate of broccoli and sauce”</p>
+            <p class="prompt">“Isolated beach paradise with turquoise waters and lush greenery”</p>
+            <p class="prompt">“Modern pink geometric wall design with sleek lamp”</p>
+            <span class="row-head repa">REPA</span>
+            <img class="zoomable" src="static/images/samples/t2i/t2i_05_repa.jpg" alt="REPA: a green train coming down the tracks">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_06_repa.jpg" alt="REPA: a zebra standing at the edge of a pond">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_07_repa.jpg" alt="REPA: a close up of a plate of broccoli and sauce">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_08_repa.jpg" alt="REPA: an isolated beach paradise with turquoise waters and lush greenery">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_09_repa.jpg" alt="REPA: a modern pink geometric wall design with a sleek lamp">
+            <span class="row-head recon">RECON</span>
+            <img class="zoomable" src="static/images/samples/t2i/t2i_05_recon.jpg" alt="RECON: a green train coming down the tracks">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_06_recon.jpg" alt="RECON: a zebra standing at the edge of a pond">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_07_recon.jpg" alt="RECON: a close up of a plate of broccoli and sauce">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_08_recon.jpg" alt="RECON: an isolated beach paradise with turquoise waters and lush greenery">
+            <img class="zoomable" src="static/images/samples/t2i/t2i_09_recon.jpg" alt="RECON: a modern pink geometric wall design with a sleek lamp">
+          </div>
+        </div>
+        <figcaption><b>Text-to-image samples (BLIP3-o).</b> Curated samples from REPA (top row) and RECON (bottom row) after 100K training iterations, for the prompts shown above each column.</figcaption>
+      </figure>
+
+      <details id="hparams">
+        <summary>Implementation details and hyperparameters</summary>
+        <div class="seg" role="tablist" aria-label="Show the settings for">
+          <button type="button" role="tab" id="tab-hp-c2i" aria-controls="panel-hp-c2i" aria-selected="true">Class-to-image</button>
+          <button type="button" role="tab" id="tab-hp-t2i" aria-controls="panel-hp-t2i" aria-selected="false" tabindex="-1">Text-to-image</button>
+        </div>
+        <div role="tabpanel" id="panel-hp-c2i" aria-labelledby="tab-hp-c2i">
+          <div class="table-wrap">
+            <table class="rtable">
+              <thead><tr><th class="l"></th><th>SiT-B/2</th><th>SiT-L/2</th><th>SiT-XL/2</th></tr></thead>
+              <tbody>
+                <tr class="group"><td colspan="4">Architecture</td></tr>
+                <tr><td class="l">Input</td><td colspan="3">32&times;32&times;4 SD-VAE latent</td></tr>
+                <tr><td class="l">Layers / hidden dim. / heads</td><td>12 / 768 / 12</td><td>24 / 1024 / 16</td><td>28 / 1152 / 16</td></tr>
+                <tr class="group"><td colspan="4">Alignment (REPA)</td></tr>
+                <tr><td class="l">$\lambda$ / alignment depth</td><td>1.5 / 4</td><td>1.5 / 8</td><td>1.5 / 8</td></tr>
+                <tr><td class="l">Similarity / vision encoder</td><td colspan="3">cosine / DINOv2-B</td></tr>
+                <tr class="group"><td colspan="4">RECON</td></tr>
+                <tr><td class="l">Semantic tokens $k$ / $t_{\max}$ (training)</td><td colspan="3">1 / 0.5</td></tr>
+                <tr><td class="l">Dimension matching</td><td>identity</td><td>zero-pad</td><td>zero-pad</td></tr>
+                <tr class="group"><td colspan="4">Optimization</td></tr>
+                <tr><td class="l">Iterations</td><td>100K</td><td>100K</td><td>400K&ndash;2.4M</td></tr>
+                <tr><td class="l">Batch size / optimizer / learning rate</td><td colspan="3">256 / AdamW / $10^{-4}$, $(\beta_1,\beta_2)=(0.9,0.999)$</td></tr>
+                <tr class="group"><td colspan="4">Sampling</td></tr>
+                <tr><td class="l">Objective / sampler / steps</td><td colspan="3">$v$-prediction / Euler&ndash;Maruyama SDE / 250</td></tr>
+                <tr><td class="l">Guidance&Dagger;</td><td colspan="3">Autoguidance</td></tr>
+                <tr><td class="l">Weak model</td><td colspan="3">SiT-XL/2 + RECON, 100K iter.</td></tr>
+                <tr><td class="l">Guidance scale $w$</td><td colspan="3">1.4</td></tr>
+                <tr><td class="l">Guidance interval</td><td colspan="3">$(0, 0.85)$</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="tcap">
+            &Dagger;: only for the guided SiT-XL/2 results.
+            $g_\phi$ is a three-layer MLP with SiLU activations, as in REPA. All models are trained on 4 NVIDIA H100 GPUs: a 400K-iteration SiT-XL/2 run takes about 27 hours (&asymp;110 GPU-hours) and the longest 2.4M-iteration run about 6.8 days (&asymp;650 GPU-hours).
+            RECON adds a single token to the 256 patch tokens of the later layers, so its training cost is essentially that of REPA.
+          </p>
+        </div>
+        <div role="tabpanel" id="panel-hp-t2i" aria-labelledby="tab-hp-t2i" hidden>
+          <div class="table-wrap">
+            <table class="rtable">
+              <thead><tr><th class="l"></th><th>MS-COCO</th><th>BLIP3-o</th></tr></thead>
+              <tbody>
+                <tr class="group"><td colspan="3">Architecture</td></tr>
+                <tr><td class="l">Input</td><td colspan="2">32&times;32&times;4 SD-VAE latent</td></tr>
+                <tr><td class="l">Backbone</td><td>MMDiT</td><td>NanoGen&dagger;</td></tr>
+                <tr><td class="l">Layers / hidden dim. / heads</td><td>24 / 768 / 24</td><td>28 + 2 / 1152, 2048 / 16</td></tr>
+                <tr class="group"><td colspan="3">Text conditioning</td></tr>
+                <tr><td class="l">Text encoder / max. text tokens</td><td>CLIP ViT-L/14 / 77</td><td>Qwen3-0.6B / 256</td></tr>
+                <tr><td class="l">Timestep tokens</td><td>0 (adaLN)</td><td>4</td></tr>
+                <tr><td class="l">CFG dropout</td><td colspan="2">0.1</td></tr>
+                <tr class="group"><td colspan="3">Alignment (REPA)</td></tr>
+                <tr><td class="l">$\lambda$ / alignment depth</td><td colspan="2">1.5 / 8</td></tr>
+                <tr><td class="l">Similarity / vision encoder</td><td colspan="2">cosine / DINOv2-B</td></tr>
+                <tr class="group"><td colspan="3">RECON</td></tr>
+                <tr><td class="l">Semantic tokens $k$ / $t_{\max}$ (training)</td><td colspan="2">1 / 0.5</td></tr>
+                <tr><td class="l">Dimension matching</td><td>identity</td><td>zero-pad</td></tr>
+                <tr class="group"><td colspan="3">Optimization</td></tr>
+                <tr><td class="l">Iterations</td><td>150K</td><td>100K</td></tr>
+                <tr><td class="l">Batch size / optimizer</td><td>256 / AdamW</td><td>1024 / AdamW</td></tr>
+                <tr><td class="l">Learning rate</td><td>$10^{-4}$, $(\beta_1,\beta_2)=(0.9,0.999)$</td><td>$2\times10^{-4}$, $(\beta_1,\beta_2)=(0.9,0.95)$</td></tr>
+                <tr><td class="l">EMA decay</td><td>0.9999</td><td>0.9995</td></tr>
+                <tr class="group"><td colspan="3">Sampling</td></tr>
+                <tr><td class="l">Time sampling (training)</td><td>uniform</td><td>logit-normal</td></tr>
+                <tr><td class="l">Sampler / steps</td><td>Heun ODE / 50</td><td>Euler ODE / 50</td></tr>
+                <tr><td class="l">Guidance scale $w$</td><td>1, 2</td><td>1, 8</td></tr>
+                <tr class="group"><td colspan="3">Data</td></tr>
+                <tr><td class="l">Training images</td><td>&sim;83K</td><td>&sim;36M</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="tcap">
+            &dagger;: NanoGen is a text-to-image variant of DDT, with an encoder and a decoder. Its layers and hidden dims are given for the encoder and the decoder.
+            $g_\phi$ is a three-layer MLP for MMDiT and a linear layer for NanoGen.
+          </p>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================ DYNAMICS -->
+    <section id="dynamics">
+      <h2>Richer Semantics Inside the Model</h2>
+
+      <h3>More semantics in every layer</h3>
+      <p>
+        We measure the semantics of each layer of SiT-XL/2 in two ways: CKNNA against DINOv2-B, and the top-1 accuracy of a linear probe trained on the layer's frozen features on ImageNet-1K.<d-footnote>Both are measured on the 400K-iteration EMA checkpoint at $t=0.25$ with the null class label. For a fair comparison, RECON's semantic token is excluded before pooling the patch features.</d-footnote>
+        RECON brings more semantics to every layer under both measures.
+        Over the later layers that receive the semantic token, it raises mean CKNNA by <strong>21.2%</strong> and mean linear-probing accuracy by <strong>4.9%</strong>.
+      </p>
+      <figure class="l-body-outset">
+        <div class="pair-grid dynamics-grid">
+          <img class="zoomable" src="static/images/plots/dynamics_cknna.svg" alt="CKNNA per layer for REPA and RECON: RECON is higher across layers, with a 21.2% higher mean over layers 8 to 27.">
+          <img class="zoomable" src="static/images/plots/dynamics_lp.svg" alt="Linear-probe top-1 accuracy per layer for REPA and RECON: RECON is higher across layers, with a 4.9% higher mean over layers 8 to 27.">
+          <div class="subcap">(a) CKNNA with DINOv2-B</div>
+          <div class="subcap">(b) Linear-probe top-1 accuracy on ImageNet-1K</div>
+        </div>
+        <figcaption><b>RECON improves the semantics of every layer.</b> REPA vs. RECON (SiT-XL/2, 400K iterations, $t=0.25$). Dashed levels mark the mean over the layers after the alignment depth, which receive the semantic token.</figcaption>
+      </figure>
+
+      <h3>Structure settles earlier during sampling</h3>
+      <p>
+        Richer features also change how a sample develops.
+        We follow the <em>semantic trajectory</em> of a sample: at every step, the cosine similarity in DINOv2 space between the running estimate $\hat x_0(t)$ and the final image, which tells how much of the subject and layout is already decided at time $t$.
+        RECON's estimate reaches the final layout earlier, for a single sample (both models start from the same noise) and across 10K samples.
+      </p>
+      <figure class="l-page">
+        <div class="pair-grid settle-grid">
+          <img class="zoomable" src="static/images/plots/settle_traj.png" alt="Semantic similarity to the final sample against diffusion time for one sample: RECON's curve is above REPA's at every step and crosses 0.8 earlier; thumbnails show each method's running estimate.">
+          <img class="zoomable" src="static/images/plots/settle_cdf.svg" alt="Fraction of 10K samples whose similarity to their final image exceeds 0.8, against diffusion time: RECON's curve rises earlier, by about 0.05 in t at a fraction of 0.4.">
+          <div class="subcap">(a) Semantic emergence over generation</div>
+          <div class="subcap">(b) When does structure settle?</div>
+        </div>
+        <figcaption>
+          <b>RECON settles the structure of a sample earlier.</b>
+          (a) How close the running estimate $\hat x_0(t)$ is, in DINOv2 space, to the image the same run finally produces; RECON is above REPA at every step.
+          (b) Over 10K generated images, the fraction whose running estimate has similarity above 0.8 with the final image at each timestep.
+        </figcaption>
+      </figure>
+
+      <h3>Fewer sampling steps</h3>
+      <div class="split wide-left">
+        <div>
+          <p>
+            Because structure emerges earlier, RECON needs fewer sampling steps.
+            Cutting the number of function evaluations from 250 to 100 and 50, with everything else fixed, degrades REPA from 7.9 to 8.4 and 10.82 gFID, while RECON stays at 3.2 and goes to only 3.3.
+            That is 2.5&times; to 5&times; fewer network evaluations at inference at almost no cost in quality.
+          </p>
+        </div>
+        <div class="mini-table">
+          <p class="tcap"><b>Sampling steps.</b> gFID-50K; SiT-XL/2, 400K iterations, no CFG.</p>
+          <div class="table-wrap">
+            <table class="rtable">
+              <thead><tr><th class="l">NFE</th><th>50</th><th>100</th><th>250</th></tr></thead>
+              <tbody>
+                <tr><td class="l">REPA</td><td>10.82</td><td>8.4</td><td>7.9</td></tr>
+                <tr class="ours"><td class="l">RECON</td><td>3.3</td><td>3.2</td><td>3.2</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <h3 id="denoise">Recovering heavily corrupted images</h3>
+      <p>
+        A related test: can the model recover an image from heavy corruption?
+        We move a clean image along the interpolant to $t=0.8$ (80% noise, 20% image) and let REPA and RECON (SiT-XL/2) denoise it from the same noisy latent, with the same class label, sampling noise and sampler (Euler&ndash;Maruyama, 200 steps, no CFG), so any difference comes from the model.
+        RECON commits to the subject within the first few steps and recovers the identity and layout of the input better, while REPA's estimates stay blurry for much longer.
+      </p>
+      <figure class="l-body-outset viewer" id="denoise-viewer">
+        <div class="thumbs" role="group" aria-label="Choose an input image"></div>
+        <div class="denoise-stage">
+          <div class="pane"><img class="zoomable" data-pane="input" alt="Clean input image"><span class="pane-label">Clean input</span></div>
+          <div class="pane"><img class="zoomable" data-pane="repa" alt=""><span class="pane-label repa">REPA &nbsp;$\hat x_0(t)$</span></div>
+          <div class="pane"><img class="zoomable" data-pane="recon" alt=""><span class="pane-label recon">RECON &nbsp;$\hat x_0(t)$</span></div>
+        </div>
+        <div class="slider-row">
+          <button class="play-btn" type="button" aria-label="Play the denoising trajectory"></button>
+          <div class="slider-wrap">
+            <input class="tslider" type="range" min="0" max="8" step="1" value="0" aria-label="Diffusion time">
+            <div class="ticks"><span>0.80</span><span>0.70</span><span>0.60</span><span>0.50</span><span>0.40</span><span>0.30</span><span>0.20</span><span>0.10</span><span>0.00</span></div>
+          </div>
+          <div class="t-readout">t = 0.80</div>
+        </div>
+        <figcaption>
+          <b>Denoising heavily corrupted images.</b> Drag the slider (or press play) to step from $t=0.8$ to $t=0$; each frame is the clean-image estimate $\hat x_0(t)$.
+          Neither model can reconstruct the input exactly from 80% noise; the difference is in how fast and how faithfully a plausible image forms.
+        </figcaption>
+      </figure>
+    </section>
+
+    <!-- ====================================================== GENERALIZATION -->
+    <section id="generalization">
+      <h2>Generalization and Scalability</h2>
+      <p>
+        Unless stated otherwise, every run here uses SD-VAE latents, DINOv2-B as the target encoder and alignment depth 8 (4 for SiT-B/2), is evaluated without guidance, and is compared with vanilla REPA trained under the same protocol.
+      </p>
+      <figure class="l-page">
+        <div class="gen-grid">
+          <img class="zoomable" src="static/images/plots/gen_scale.svg" alt="gFID-50K at 20 epochs: SiT-B/2 46.4 vs 26.1, SiT-L/2 22.9 vs 11.2, SiT-XL/2 18.9 vs 9.2 for REPA vs RECON.">
+          <img class="zoomable" src="static/images/plots/gen_latents.svg" alt="gFID-50K at 80 epochs: SD-VAE 7.8 vs 3.2, VA-VAE 5.0 vs 4.0, InVAE 7.4 vs 4.8 for REPA vs RECON.">
+          <img class="zoomable" src="static/images/plots/gen_encoders.svg" alt="gFID-50K for SiT-B/2 at 20 epochs with five target encoders: DINOv2-B 46.4 vs 26.1, I-JEPA-H 48.6 vs 26.6, MoCo-v3-B 52.0 vs 34.5, SigLIP2-B 53.9 vs 43.6, WebSSL-DINO-1B 49.6 vs 24.9 for REPA vs RECON.">
+          <div class="subcap">(a) Model scale</div>
+          <div class="subcap">(b) Tokenizer</div>
+          <div class="subcap">(c) Target vision encoder</div>
+        </div>
+        <figcaption><b>RECON vs. REPA across model scale, tokenizer and target encoder</b> (gFID-50K, lower is better). (a) SiT-B/2, L/2 and XL/2 at 20 epochs. (b) Three tokenizers, SiT-XL at 80 epochs. (c) Five target encoders, SiT-B/2 at 20 epochs.</figcaption>
+      </figure>
+      <ul>
+        <li><strong>Model scale.</strong> RECON improves REPA substantially at every scale. SiT-L/2 with RECON (11.24) is even better than the larger SiT-XL/2 with REPA (18.88) at the same budget.</li>
+        <li><strong>Tokenizers.</strong> Gains hold on SD-VAE<d-cite key="rombach2022ldm"></d-cite> (7.84 &rarr; 3.25), In-VAE<d-cite key="leng2025repae"></d-cite> (7.41 &rarr; 4.78) and VA-VAE<d-cite key="yao2025vavae"></d-cite> (4.95 &rarr; 4.02). The gain on VA-VAE is smaller, likely because that tokenizer is itself trained with an alignment loss, so part of the semantics RECON injects is already in its latent space.<d-footnote>For VA-VAE and In-VAE ($16\times16\times32$ latents) we use patch size 1, so all three tokenizers give 256 tokens and the same compute per step.</d-footnote></li>
+        <li><strong>Target encoders.</strong> RECON improves REPA with all five encoders: I-JEPA-H<d-cite key="assran2023ijepa"></d-cite>, DINOv2-B, MoCo-v3-B<d-cite key="chen2021mocov3"></d-cite>, SigLIP2-B<d-cite key="tschannen2025siglip2"></d-cite> and WebSSL-DINO-1B<d-cite key="fan2025webssl"></d-cite>. Since it pools patch features, it does not need a class token, unlike REG, which works best when aligning with the encoder's class token.</li>
+      </ul>
+
+      <details>
+        <summary>Full metrics: FID, IS, precision and recall</summary>
+        <div class="tables-2 even">
+          <div>
+            <p class="tcap"><b>Model scale.</b> 20 epochs, SD-VAE, no CFG.</p>
+            <div class="table-wrap">
+              <table class="rtable">
+                <thead><tr><th class="l">Model</th><th class="l">Method</th><th>FID&darr;</th><th>IS&uarr;</th><th>Pre.&uarr;</th><th>Rec.&uarr;</th></tr></thead>
+                <tbody>
+                  <tr><td class="l" rowspan="2">SiT-B/2</td><td class="l">REPA</td><td>46.35</td><td>30.53</td><td>0.477</td><td>0.608</td></tr>
+                  <tr class="ours"><td class="l">RECON</td><td>26.08</td><td>54.63</td><td>0.620</td><td>0.577</td></tr>
+                  <tr class="sep"><td class="l" rowspan="2">SiT-L/2</td><td class="l">REPA</td><td>22.95</td><td>59.17</td><td>0.618</td><td>0.610</td></tr>
+                  <tr class="ours"><td class="l">RECON</td><td>11.24</td><td>104.44</td><td>0.742</td><td>0.550</td></tr>
+                  <tr class="sep"><td class="l" rowspan="2">SiT-XL/2</td><td class="l">REPA</td><td>18.88</td><td>69.34</td><td>0.647</td><td>0.608</td></tr>
+                  <tr class="ours"><td class="l">RECON</td><td>9.25</td><td>118.80</td><td>0.760</td><td>0.543</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <p class="tcap"><b>Tokenizer.</b> SiT-XL, 80 epochs, no CFG.</p>
+            <div class="table-wrap">
+              <table class="rtable">
+                <thead><tr><th class="l">Latent</th><th class="l">Method</th><th>FID&darr;</th><th>IS&uarr;</th><th>Pre.&uarr;</th><th>Rec.&uarr;</th></tr></thead>
+                <tbody>
+                  <tr><td class="l" rowspan="2">SD-VAE</td><td class="l">REPA</td><td>7.84</td><td>125.43</td><td>0.700</td><td>0.654</td></tr>
+                  <tr class="ours"><td class="l">RECON</td><td>3.25</td><td>204.18</td><td>0.817</td><td>0.565</td></tr>
+                  <tr class="sep"><td class="l" rowspan="2">VA-VAE</td><td class="l">REPA</td><td>4.95</td><td>146.43</td><td>0.761</td><td>0.611</td></tr>
+                  <tr class="ours"><td class="l">RECON</td><td>4.02</td><td>163.04</td><td>0.774</td><td>0.604</td></tr>
+                  <tr class="sep"><td class="l" rowspan="2">InVAE</td><td class="l">REPA</td><td>7.41</td><td>125.25</td><td>0.712</td><td>0.655</td></tr>
+                  <tr class="ours"><td class="l">RECON</td><td>4.78</td><td>151.10</td><td>0.755</td><td>0.627</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        <p class="tcap" style="margin-top:14px"><b>Target encoder.</b> SiT-B/2, 20 epochs, SD-VAE, no CFG.</p>
+        <div class="table-wrap">
+          <table class="rtable">
+            <thead><tr><th class="l">Encoder</th><th class="l">Method</th><th>FID&darr;</th><th>IS&uarr;</th><th>Pre.&uarr;</th><th>Rec.&uarr;</th></tr></thead>
+            <tbody>
+              <tr><td class="l" rowspan="2">DINOv2-B</td><td class="l">REPA</td><td>46.35</td><td>30.53</td><td>0.477</td><td>0.608</td></tr>
+              <tr class="ours"><td class="l">RECON</td><td>26.08</td><td>54.63</td><td>0.620</td><td>0.577</td></tr>
+              <tr class="sep"><td class="l" rowspan="2">I-JEPA-H</td><td class="l">REPA</td><td>48.56</td><td>28.41</td><td>0.465</td><td>0.596</td></tr>
+              <tr class="ours"><td class="l">RECON</td><td>26.56</td><td>54.36</td><td>0.592</td><td>0.574</td></tr>
+              <tr class="sep"><td class="l" rowspan="2">MoCo-v3-B</td><td class="l">REPA</td><td>51.98</td><td>26.60</td><td>0.449</td><td>0.597</td></tr>
+              <tr class="ours"><td class="l">RECON</td><td>34.45</td><td>41.88</td><td>0.584</td><td>0.547</td></tr>
+              <tr class="sep"><td class="l" rowspan="2">SigLIP2-B</td><td class="l">REPA</td><td>53.85</td><td>25.12</td><td>0.440</td><td>0.587</td></tr>
+              <tr class="ours"><td class="l">RECON</td><td>43.65</td><td>31.29</td><td>0.508</td><td>0.550</td></tr>
+              <tr class="sep"><td class="l" rowspan="2">WebSSL-DINO-1B</td><td class="l">REPA</td><td>49.61</td><td>28.52</td><td>0.459</td><td>0.596</td></tr>
+              <tr class="ours"><td class="l">RECON</td><td>24.92</td><td>55.74</td><td>0.656</td><td>0.527</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </section>
+
+    <!-- ============================================================ ABLATIONS -->
+    <section id="ablations">
+      <h2>Design Choices</h2>
+      <p>
+        We vary the components RECON introduces one at a time, holding the others at their defaults: the <span class="hl depth">alignment depth</span>, the <span class="hl tok">number of semantic tokens $k$</span>, the <span class="hl tmax">injection threshold $t_{\max}$</span> and the <span class="hl dm">dimension-matching mechanism</span>.
+      </p>
+      <figure class="l-body-outset">
+        <p class="tcap"><b>Component-wise analysis</b> on ImageNet 256&times;256. SiT-XL/2 with DINOv2-B as the target, 400K iterations, no classifier-free guidance. Each block varies a single component (shaded).</p>
+        <div class="table-wrap">
+          <table class="rtable">
+            <thead><tr><th>Depth</th><th>$k$</th><th>$t_{\max}$</th><th>Dim. matching</th><th>FID&darr;</th><th>IS&uarr;</th><th>Pre.&uarr;</th><th>Rec.&uarr;</th></tr></thead>
+            <tbody>
+              <tr class="base"><td class="l" colspan="4">Vanilla SiT-XL/2<d-cite key="ma2024sit"></d-cite></td><td>17.20</td><td>76.52</td><td>0.65</td><td>0.63</td></tr>
+              <tr class="base"><td class="l" colspan="4">SiT-XL/2 + REPA<d-cite key="yu2025repa"></d-cite></td><td>7.83</td><td>125.43</td><td>0.70</td><td>0.65</td></tr>
+              <tr class="sep"><td class="v-depth">6</td><td>1</td><td>0.5</td><td>zero-pad</td><td>3.26</td><td>205.86</td><td>0.81</td><td>0.56</td></tr>
+              <tr><td class="v-depth">8</td><td>1</td><td>0.5</td><td>zero-pad</td><td class="best">3.25</td><td>204.18</td><td>0.81</td><td>0.56</td></tr>
+              <tr><td class="v-depth">10</td><td>1</td><td>0.5</td><td>zero-pad</td><td>3.38</td><td>202.34</td><td>0.81</td><td>0.55</td></tr>
+              <tr class="sep"><td>8</td><td class="v-tok">1</td><td>0.5</td><td>zero-pad</td><td class="best">3.25</td><td>204.18</td><td>0.81</td><td>0.56</td></tr>
+              <tr><td>8</td><td class="v-tok">4</td><td>0.5</td><td>zero-pad</td><td>4.70</td><td>214.01</td><td>0.84</td><td>0.50</td></tr>
+              <tr class="sep"><td>8</td><td>1</td><td class="v-tmax">0.3</td><td>zero-pad</td><td>5.33</td><td>146.74</td><td>0.74</td><td>0.63</td></tr>
+              <tr><td>8</td><td>1</td><td class="v-tmax">0.5</td><td>zero-pad</td><td class="best">3.25</td><td>204.18</td><td>0.81</td><td>0.56</td></tr>
+              <tr><td>8</td><td>1</td><td class="v-tmax">1.0</td><td>zero-pad</td><td>4.70</td><td>236.82</td><td>0.84</td><td>0.44</td></tr>
+              <tr class="sep"><td>8</td><td>1</td><td>0.5</td><td class="v-dm">zero-pad</td><td class="best">3.25</td><td>204.18</td><td>0.81</td><td>0.55</td></tr>
+              <tr><td>8</td><td>1</td><td>0.5</td><td class="v-dm">linear</td><td>3.68</td><td>198.35</td><td>0.80</td><td>0.56</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </figure>
+      <div class="finding-box">
+        <ul>
+          <li><span class="hl tmax">$t_{\max}=0.5$.</span> A larger threshold exposes the later layers during training to semantics that $g_\phi$ cannot provide at inference; a smaller one leaves too little training signal for them to learn how patch tokens should interact with the semantic token.</li>
+          <li><span class="hl tok">$k=1$.</span> More semantic tokens give the patch tokens more to attend to, but they also amplify errors in $g_\phi$'s prediction, which hurts generation.</li>
+          <li><span class="hl dm">Zero-padding.</span> It is simpler than a linear map, adds no parameters and gives a better gFID (3.25 vs. 3.68).</li>
+          <li><span class="hl depth">Depth 8.</span> Aligning at layer 8 works well for XL models, and RECON is stable across a reasonable range of depths.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- =========================================================== DISCUSSION -->
+    <section id="discussion">
+      <h2>Discussion</h2>
+
+      <h3>Why do the later layers need more semantics?</h3>
+      <p>
+        The gradient of the REPA loss reaches the early layers, so they are optimized towards higher semantics.
+        The later layers are supervised by the flow-matching loss alone and depend only on $h$.
+        Injecting semantics there lets them decide, through training, whether and how to use them. At worst this should not hurt, and in practice it helps.
+      </p>
+
+      <h3 id="trajectory">Learned on part of the trajectory, used on all of it</h3>
+      <p>
+        RECON trains the later layers with the semantic token only at low noise <span class="nowrap">($t&lt;t_{\max}$)</span>, but at inference, using the token at every step works better than keeping that schedule (gFID 3.2 vs. 6.3, <a href="#tab-injection">Injection at inference</a>).
+        Gradient-based post-training of diffusion models shows a similar behaviour: DRaFT-K<d-cite key="clark2024draft"></d-cite>, AlignProp<d-cite key="prabhudesai2023alignprop"></d-cite> and ReFL<d-cite key="xu2023imagereward"></d-cite> backpropagate the reward through only a few late sampling steps, yet the fine-tuned model is applied from the very first step.
+      </p>
+      <p>
+        We think this deserves further study, in particular how the time-conditioning mechanism of the network (adaLN in SiT) affects this behaviour, and how a network trained on only part of the trajectory manages to apply what it learned at every timestep.
+      </p>
+
+      <h3>Limitations and future work</h3>
+      <p>
+        <strong>RECON needs representation alignment.</strong>
+        It reuses a projection head that a REPA-style alignment loss has already trained, so it cannot be applied to a model trained without such a loss: it removes the waste of discarding the head, not the need for alignment.
+      </p>
+      <p>
+        <strong>Fidelity and diversity.</strong>
+        RECON strongly improves sample fidelity: at 80 epochs, it raises the precision of SiT-XL/2 from 0.70 to 0.81 and IS from 125.4 to 204.2, while recall drops from 0.65 to 0.56.
+        Strong semantic conditioning may make the model commit to clear class semantics early, which leaves less room for variation.
+        RAE<d-cite key="zheng2025rae"></d-cite>, whose latent space is DINOv2 features, shows the same behaviour (precision 0.82, recall 0.59 at 80 epochs).
+      </p>
+      <p>
+        <strong>Future work.</strong>
+        Nothing in RECON depends on where the target representation comes from, only on having a trained map into a better-organized space.
+        Pairing it with methods that derive their target internally, such as SRA<d-cite key="jiang2026sra"></d-cite>, LayerSync<d-cite key="haghighi2026layersync"></d-cite> or Self-Flow<d-cite key="chefer2026selfflow"></d-cite>, would remove the external encoder while keeping the mechanism, and is the direction we find most promising.
+        Another open question is why the gain on an already semantic tokenizer such as VA-VAE is smaller: the tokenizer may limit what can be gained, or a single pooled token may not be the right signal for a latent space that is already semantically organized.
+      </p>
+    </section>
+
+    <!-- =========================================================== CONCLUSION -->
+    <section id="conclusion">
+      <h2>Conclusion</h2>
+      <p>
+        Representation alignment methods discard their projection head $g_\phi$ after training, even though its output is better aligned with the vision encoder than any layer of the diffusion transformer.
+        RECON keeps it: it supplies the head's output to the later layers as a semantic token, with no added parameters and no change to the training loss, and lets those layers decide how to use it.
+        The result is much faster convergence than REPA, gains across model scales, tokenizers, target encoders and text-to-image training, and features that are more semantic throughout the network.
+      </p>
+      <p class="message">What matters in representation alignment is not only acquiring a representation, but also keeping it accessible in generation.</p>
+    </section>
+
+  </d-article>
+
+  <!-- ============================================================= APPENDIX -->
+  <d-appendix>
+    <h3 id="bibtex">BibTeX</h3>
+    <div class="bibtex-wrap">
+      <!-- TODO: add the arXiv number (journal/eprint) once the paper is on arXiv. -->
+<pre class="bibtex" id="bibtex-entry">@article{razavi2026recon,
+  title   = {{RECON}: Representation Conditioning for Generation},
+  author  = {Razavi, Saeed and Leng, Xingjian and Zheng, Liang},
+  journal = {arXiv preprint},
+  year    = {2026}
+}</pre>
+      <button class="copy-btn" type="button" data-target="bibtex-entry">Copy</button>
+    </div>
+    <h3>Acknowledgements</h3>
+    <p class="credit">This page uses the <a href="https://github.com/distillpub/template">Distill template</a> and follows the layout of the <a href="https://rae-dit.github.io/">RAE project page</a>.</p>
+    <d-footnote-list></d-footnote-list>
+    <d-citation-list></d-citation-list>
+  </d-appendix>
+
+  <d-bibliography>
+    <script type="text/bibtex">
+@inproceedings{yu2025repa,
+  title={Representation Alignment for Generation: Training Diffusion Transformers Is Easier Than You Think},
+  author={Yu, Sihyun and Kwak, Sangkyung and Jang, Huiwon and Jeong, Jongheon and Huang, Jonathan and Shin, Jinwoo and Xie, Saining},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2025}
+}
+@inproceedings{wu2025reg,
+  title={Representation Entanglement for Generation: Training Diffusion Transformers Is Much Easier Than You Think},
+  author={Wu, Ge and Zhang, Shen and Shi, Ruijing and Gao, Shanghua and Chen, Zhenyuan and Wang, Lei and Chen, Zhaowei and Gao, Hongcheng and Tang, Yao and Yang, Jian and Cheng, Ming-Ming and Li, Xiang},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2025}
+}
+@inproceedings{wang2025ddt,
+  title={DDT: Decoupled Diffusion Transformer},
+  author={Wang, Shuai and Tian, Zhi and Huang, Weilin and Wang, Limin},
+  booktitle={Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2026}
+}
+@inproceedings{leng2025repae,
+  title={REPA-E: Unlocking VAE for End-to-End Tuning of Latent Diffusion Transformers},
+  author={Leng, Xingjian and Singh, Jaskirat and Hou, Yunzhong and Xing, Zhenchang and Xie, Saining and Zheng, Liang},
+  booktitle={International Conference on Computer Vision (ICCV)},
+  year={2025}
+}
+@article{oquab2024dinov2,
+  title={DINOv2: Learning Robust Visual Features without Supervision},
+  author={Oquab, Maxime and Darcet, Timothée and Moutakanni, Théo and Vo, Huy and Szafraniec, Marc and Khalidov, Vasil and Fernandez, Pierre and Haziza, Daniel and Massa, Francisco and El-Nouby, Alaaeldin and others},
+  journal={Transactions on Machine Learning Research (TMLR)},
+  year={2024}
+}
+@inproceedings{huh2024platonic,
+  title={Position: The Platonic Representation Hypothesis},
+  author={Huh, Minyoung and Cheung, Brian and Wang, Tongzhou and Isola, Phillip},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2024}
+}
+@inproceedings{ma2024sit,
+  title={SiT: Exploring Flow and Diffusion-Based Generative Models with Scalable Interpolant Transformers},
+  author={Ma, Nanye and Goldstein, Mark and Albergo, Michael S. and Boffi, Nicholas M. and Vanden-Eijnden, Eric and Xie, Saining},
+  booktitle={European Conference on Computer Vision (ECCV)},
+  year={2024}
+}
+@inproceedings{lipman2023flow,
+  title={Flow Matching for Generative Modeling},
+  author={Lipman, Yaron and Chen, Ricky T. Q. and Ben-Hamu, Heli and Nickel, Maximilian and Le, Matt},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2023}
+}
+@inproceedings{liu2023rectifiedflow,
+  title={Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow},
+  author={Liu, Xingchao and Gong, Chengyue and Liu, Qiang},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2023}
+}
+@inproceedings{rombach2022ldm,
+  title={High-Resolution Image Synthesis with Latent Diffusion Models},
+  author={Rombach, Robin and Blattmann, Andreas and Lorenz, Dominik and Esser, Patrick and Ommer, Björn},
+  booktitle={Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2022}
+}
+@inproceedings{deng2009imagenet,
+  title={ImageNet: A Large-Scale Hierarchical Image Database},
+  author={Deng, Jia and Dong, Wei and Socher, Richard and Li, Li-Jia and Li, Kai and Fei-Fei, Li},
+  booktitle={Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2009}
+}
+@inproceedings{peebles2023dit,
+  title={Scalable Diffusion Models with Transformers},
+  author={Peebles, William and Xie, Saining},
+  booktitle={International Conference on Computer Vision (ICCV)},
+  year={2023}
+}
+@inproceedings{gao2023mdt,
+  title={Masked Diffusion Transformer is a Strong Image Synthesizer},
+  author={Gao, Shanghua and Zhou, Pan and Cheng, Ming-Ming and Yan, Shuicheng},
+  booktitle={International Conference on Computer Vision (ICCV)},
+  year={2023}
+}
+@article{zheng2024maskdit,
+  title={Fast Training of Diffusion Models with Masked Transformers},
+  author={Zheng, Hongkai and Nie, Weili and Vahdat, Arash and Anandkumar, Anima},
+  journal={Transactions on Machine Learning Research (TMLR)},
+  year={2024}
+}
+@inproceedings{jiang2026sra,
+  title={Representation Alignment for Diffusion Transformers without External Components},
+  author={Jiang, Dengyang and Wang, Mengmeng and Li, Liuzhuozheng and Zhang, Lei and Wang, Haoyu and Wei, Wei and Dai, Guang and Zhang, Yanning and Wang, Jingdong},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2026}
+}
+@inproceedings{haghighi2026layersync,
+  title={LayerSync: Self-aligning Intermediate Layers},
+  author={Haghighi, Yasaman and van Delft, Bastien and Hassan, Mariam and Alahi, Alexandre},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2026}
+}
+@inproceedings{chefer2026selfflow,
+  title={Self-Supervised Flow Matching for Scalable Multi-Modal Synthesis},
+  author={Chefer, Hila and Esser, Patrick and Lorenz, Dominik and Podell, Dustin and Raja, Vikash and Tong, Vinh and Torralba, Antonio and Rombach, Robin},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2026}
+}
+@inproceedings{yao2025vavae,
+  title={Reconstruction vs. Generation: Taming Optimization Dilemma in Latent Diffusion Models},
+  author={Yao, Jingfeng and Yang, Bin and Wang, Xinggang},
+  booktitle={Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2025}
+}
+@inproceedings{karras2024autoguidance,
+  title={Guiding a Diffusion Model with a Bad Version of Itself},
+  author={Karras, Tero and Aittala, Miika and Kynkäänniemi, Tuomas and Lehtinen, Jaakko and Aila, Timo and Laine, Samuli},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2024}
+}
+@inproceedings{dhariwal2021adm,
+  title={Diffusion Models Beat GANs on Image Synthesis},
+  author={Dhariwal, Prafulla and Nichol, Alexander},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2021}
+}
+@inproceedings{kingma2023vdmpp,
+  title={Understanding Diffusion Objectives as the ELBO with Simple Data Augmentation},
+  author={Kingma, Diederik P. and Gao, Ruiqi},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2023}
+}
+@inproceedings{hoogeboom2023simple,
+  title={simple diffusion: End-to-end diffusion for high resolution images},
+  author={Hoogeboom, Emiel and Heek, Jonathan and Salimans, Tim},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2023}
+}
+@article{ho2022cdm,
+  title={Cascaded Diffusion Models for High Fidelity Image Generation},
+  author={Ho, Jonathan and Saharia, Chitwan and Chan, William and Fleet, David J. and Norouzi, Mohammad and Salimans, Tim},
+  journal={Journal of Machine Learning Research (JMLR)},
+  year={2022}
+}
+@inproceedings{bao2023uvit,
+  title={All are Worth Words: A ViT Backbone for Diffusion Models},
+  author={Bao, Fan and Nie, Shen and Xue, Kaiwen and Cao, Yue and Li, Chongxuan and Su, Hang and Zhu, Jun},
+  booktitle={Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2023}
+}
+@inproceedings{hatamizadeh2024diffit,
+  title={DiffiT: Diffusion Vision Transformers for Image Generation},
+  author={Hatamizadeh, Ali and Song, Jiaming and Liu, Guilin and Kautz, Jan and Vahdat, Arash},
+  booktitle={European Conference on Computer Vision (ECCV)},
+  year={2024}
+}
+@inproceedings{zhu2024sddit,
+  title={SD-DiT: Unleashing the Power of Self-supervised Discrimination in Diffusion Transformer},
+  author={Zhu, Rui and Pan, Yingwei and Li, Yehao and Yao, Ting and Sun, Zhenglong and Mei, Tao and Chen, Chang Wen},
+  booktitle={Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2024}
+}
+@inproceedings{esser2024sd3,
+  title={Scaling Rectified Flow Transformers for High-Resolution Image Synthesis},
+  author={Esser, Patrick and Kulal, Sumith and Blattmann, Andreas and Entezari, Rahim and Müller, Jonas and Saini, Harry and Levi, Yam and Lorenz, Dominik and Sauer, Axel and Boesel, Frederic and Podell, Dustin and Dockhorn, Tim and English, Zion and Lacey, Kyle and Goodwin, Alex and Marek, Yannik and Rombach, Robin},
+  booktitle={International Conference on Machine Learning (ICML)},
+  year={2024}
+}
+@inproceedings{lin2014coco,
+  title={Microsoft COCO: Common Objects in Context},
+  author={Lin, Tsung-Yi and Maire, Michael and Belongie, Serge and Hays, James and Perona, Pietro and Ramanan, Deva and Dollár, Piotr and Zitnick, C. Lawrence},
+  booktitle={European Conference on Computer Vision (ECCV)},
+  year={2014}
+}
+@article{leng2026diffusionbench,
+  title={DiffusionBench: On Holistic Evaluation of Diffusion Transformers},
+  author={Leng, Xingjian and Singh, Jaskirat and Liang, Zhanhao and Smith, Ethan and Bell, Martin and Saha, Aninda and Yuan, Yuhui and Zheng, Liang},
+  journal={arXiv preprint arXiv:2606.24888},
+  year={2026}
+}
+@article{chen2025blip3o,
+  title={BLIP3-o: A Family of Fully Open Unified Multimodal Models -- Architecture, Training and Dataset},
+  author={Chen, Jiuhai and Xu, Zhiyang and Pan, Xichen and Hu, Yushi and Qin, Can and Goldstein, Tom and Huang, Lifu and Zhou, Tianyi and Xie, Saining and Savarese, Silvio and Xue, Le and Xiong, Caiming and Xu, Ran},
+  journal={arXiv preprint arXiv:2505.09568},
+  year={2025}
+}
+@inproceedings{assran2023ijepa,
+  title={Self-Supervised Learning from Images with a Joint-Embedding Predictive Architecture},
+  author={Assran, Mahmoud and Duval, Quentin and Misra, Ishan and Bojanowski, Piotr and Vincent, Pascal and Rabbat, Michael and LeCun, Yann and Ballas, Nicolas},
+  booktitle={Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2023}
+}
+@inproceedings{chen2021mocov3,
+  title={An Empirical Study of Training Self-Supervised Vision Transformers},
+  author={Chen, Xinlei and Xie, Saining and He, Kaiming},
+  booktitle={International Conference on Computer Vision (ICCV)},
+  year={2021}
+}
+@article{tschannen2025siglip2,
+  title={SigLIP 2: Multilingual Vision-Language Encoders with Improved Semantic Understanding, Localization, and Dense Features},
+  author={Tschannen, Michael and Gritsenko, Alexey and Wang, Xiao and Naeem, Muhammad Ferjad and Alabdulmohsin, Ibrahim and Parthasarathy, Nikhil and Evans, Talfan and Beyer, Lucas and Xia, Ye and Mustafa, Basil and Hénaff, Olivier and Harmsen, Jeremiah and Steiner, Andreas and Zhai, Xiaohua},
+  journal={arXiv preprint arXiv:2502.14786},
+  year={2025}
+}
+@inproceedings{fan2025webssl,
+  title={Scaling Language-Free Visual Representation Learning},
+  author={Fan, David and Tong, Shengbang and Zhu, Jiachen and Sinha, Koustuv and Liu, Zhuang and Chen, Xinlei and Rabbat, Michael and Ballas, Nicolas and LeCun, Yann and Bar, Amir and Xie, Saining},
+  booktitle={International Conference on Computer Vision (ICCV)},
+  year={2025}
+}
+@inproceedings{clark2024draft,
+  title={Directly Fine-Tuning Diffusion Models on Differentiable Rewards},
+  author={Clark, Kevin and Vicol, Paul and Swersky, Kevin and Fleet, David J.},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2024}
+}
+@article{prabhudesai2023alignprop,
+  title={Aligning Text-to-Image Diffusion Models with Reward Backpropagation},
+  author={Prabhudesai, Mihir and Goyal, Anirudh and Pathak, Deepak and Fragkiadaki, Katerina},
+  journal={arXiv preprint arXiv:2310.03739},
+  year={2023}
+}
+@inproceedings{xu2023imagereward,
+  title={ImageReward: Learning and Evaluating Human Preferences for Text-to-Image Generation},
+  author={Xu, Jiazheng and Liu, Xiao and Wu, Yuchen and Tong, Yuxuan and Li, Qinkai and Ding, Ming and Tang, Jie and Dong, Yuxiao},
+  booktitle={Advances in Neural Information Processing Systems (NeurIPS)},
+  year={2023}
+}
+@inproceedings{zheng2025rae,
+  title={Diffusion Transformers with Representation Autoencoders},
+  author={Zheng, Boyang and Ma, Nanye and Tong, Shengbang and Xie, Saining},
+  booktitle={International Conference on Learning Representations (ICLR)},
+  year={2026}
+}
+    </script>
+  </d-bibliography>
+</body>
+</html>
